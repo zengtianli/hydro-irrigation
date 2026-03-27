@@ -1,0 +1,2 @@
+ForcastDate	2025/07/15
+ForcastDays	16
