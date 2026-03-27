@@ -17,6 +17,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 DATA_SAMPLE_DIR = REPO_ROOT / 'data' / 'sample'
 DATA_OUTPUT_DIR = REPO_ROOT / 'data' / 'output'
+sys.path.insert(0, str(REPO_ROOT))
 
 from src.common.st_utils import page_config, excel_download, footer
 

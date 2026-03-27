@@ -1,0 +1,6 @@
+name: irrigation
+title: 灌溉需水
+icon: "🌾"
+order: 50
+description: 水稻+旱地灌溉需水量水平衡计算
+version: 1.0.0
