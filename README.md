@@ -18,7 +18,7 @@
 
 ---
 
-![hydro-irrigation demo](docs/screenshots/demo.svg)
+![hydro-irrigation demo](docs/screenshots/demo.png)
 
         ---
 
