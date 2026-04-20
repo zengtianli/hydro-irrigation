@@ -9,18 +9,22 @@ Output: ZIP containing OUT_GGXS_*.txt + OUT_PYCS_*.txt (+ water_balance_*.txt,
 """
 from __future__ import annotations
 
+import base64
 import io
+import json
 import os
 import sys
 import tempfile
+import time
 import traceback
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
+import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 # Project root on sys.path so `from src.irrigation...` resolves like Streamlit.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -86,13 +90,19 @@ def _collect_outputs(output_dir: Path, dest_zip: zipfile.ZipFile, seen: set[str]
     return added
 
 
-def _run_irrigation(zip_bytes: bytes, calc_mode: str) -> tuple[bytes, dict]:
+def _run_irrigation(
+    zip_bytes: bytes, calc_mode: str, collect_full: bool = False
+) -> tuple[bytes, dict]:
     """Port of app.py's "开始计算" button handler, Streamlit stripped.
 
     Layout:
         tmpdir/              ← cwd during calc (combine_results writes here/data/)
             data/            ← data_path; extracted input + generated OUT_*
     `Calculator` writes results to data_path and also to cwd/data/ (same dir).
+
+    When ``collect_full`` is True the returned ``info`` additionally contains:
+        input_files: [{name, size}]
+        output_files_raw: {name: bytes}
     """
     if calc_mode not in {"crop", "irrigation", "both"}:
         raise HTTPException(400, f"calc_mode 必须是 crop/irrigation/both，收到: {calc_mode!r}")
@@ -116,14 +126,18 @@ def _run_irrigation(zip_bytes: bytes, calc_mode: str) -> tuple[bytes, dict]:
                     for m in members
                 ):
                     strip_prefix = next(iter(first_parts))
+                input_files: list[dict] = []
                 for m in members:
                     name = m
                     if strip_prefix and m.startswith(f"{strip_prefix}/"):
                         name = m[len(strip_prefix) + 1 :]
                     if not name or name.startswith("__MACOSX"):
                         continue
-                    target = data_path / Path(name).name  # flat — no nested dirs
-                    target.write_bytes(zf.read(m))
+                    flat_name = Path(name).name
+                    target = data_path / flat_name  # flat — no nested dirs
+                    data = zf.read(m)
+                    target.write_bytes(data)
+                    input_files.append({"name": flat_name, "size": len(data)})
         except zipfile.BadZipFile as e:
             raise HTTPException(400, f"ZIP 解压失败: {e}") from e
 
@@ -179,28 +193,159 @@ def _run_irrigation(zip_bytes: bytes, calc_mode: str) -> tuple[bytes, dict]:
         # Collect outputs from both data_path and tmpdir/data (same dir in our
         # layout, but be defensive — combine_results uses cwd/data explicitly).
         buf = io.BytesIO()
+        output_files_raw: dict[str, bytes] = {}
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out_zip:
             seen: set[str] = set()
-            added = _collect_outputs(data_path, out_zip, seen)
+
+            def _gather(src: Path) -> int:
+                added = 0
+                for pattern in _RESULT_GLOBS:
+                    for f in sorted(src.glob(pattern)):
+                        if not f.is_file() or f.name in seen:
+                            continue
+                        seen.add(f.name)
+                        data = f.read_bytes()
+                        out_zip.writestr(f.name, data)
+                        if collect_full:
+                            output_files_raw[f.name] = data
+                        added += 1
+                return added
+
+            added = _gather(data_path)
             cwd_data = tmpdir / "data"
             if cwd_data.resolve() != data_path.resolve():
-                added += _collect_outputs(cwd_data, out_zip, seen)
+                added += _gather(cwd_data)
             if added == 0:
                 raise HTTPException(500, "计算结束但没有生成任何 OUT_*.txt，可能输入格式有误")
 
+        if collect_full:
+            info["input_files"] = input_files
+            info["output_files_raw"] = output_files_raw
         return buf.getvalue(), info
+
+
+_TABLE_ROW_LIMIT = 500
+_TEXT_PREVIEW_LINES = 50
+
+
+def _txt_to_payload(name: str, data: bytes) -> dict:
+    """Try to read a tab/whitespace-separated table; fall back to text preview.
+
+    Returns one of:
+        {"kind": "table", "columns": [...], "rows": [...], "totalRows": N}
+        {"kind": "text",  "text": "first N lines…", "totalLines": N}
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("gbk")
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", errors="replace")
+
+    # Try tab first (most output files), then whitespace.
+    for sep in ("\t", r"\s+"):
+        try:
+            df = pd.read_csv(
+                io.StringIO(text),
+                sep=sep,
+                engine="python",
+                dtype=str,
+                keep_default_na=False,
+            )
+            if df.shape[1] >= 2 and len(df) > 0:
+                total = len(df)
+                sliced = df.head(_TABLE_ROW_LIMIT) if total > _TABLE_ROW_LIMIT else df
+                # Attempt numeric coercion column-wise for nicer display.
+                for col in sliced.columns:
+                    try:
+                        coerced = pd.to_numeric(sliced[col])
+                        sliced[col] = coerced
+                    except (ValueError, TypeError):
+                        pass
+                parsed = json.loads(
+                    sliced.to_json(orient="split", force_ascii=False)
+                )
+                return {
+                    "kind": "table",
+                    "columns": [str(c) for c in parsed["columns"]],
+                    "rows": parsed["data"],
+                    "totalRows": int(total),
+                }
+        except Exception:
+            continue
+
+    # Fall back to plain text preview.
+    lines = text.splitlines()
+    preview = "\n".join(lines[:_TEXT_PREVIEW_LINES])
+    return {"kind": "text", "text": preview, "totalLines": len(lines)}
+
+
+def _run_irrigation_full(zip_bytes: bytes, calc_mode: str) -> dict:
+    """Run calc + build rich JSON payload (preview / meta / results / zipBase64)."""
+    started = time.perf_counter()
+    result_zip, info = _run_irrigation(zip_bytes, calc_mode, collect_full=True)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    input_files = info.get("input_files", [])
+    raw_outputs: dict[str, bytes] = info.get("output_files_raw", {})
+
+    output_files_meta: list[dict] = []
+    results_payload: dict[str, dict] = {}
+    for name in sorted(raw_outputs.keys()):
+        data = raw_outputs[name]
+        results_payload[name] = _txt_to_payload(name, data)
+        output_files_meta.append(
+            {
+                "name": name,
+                "size": len(data),
+                "type": "txt" if name.lower().endswith(".txt") else "bin",
+            }
+        )
+
+    total_in_size = sum(f["size"] for f in input_files)
+
+    meta_payload: dict = {
+        "calcMode": info.get("calc_mode", calc_mode),
+        "startTime": info.get("start_time"),
+        "forecastDays": info.get("forecast_days"),
+        "numAreas": info.get("num_areas"),
+        "systems": info.get("systems", []),
+        "elapsedMs": elapsed_ms,
+        "zipBytes": len(result_zip),
+    }
+    if "total_irrigation" in info:
+        meta_payload["totalIrrigation"] = info["total_irrigation"]
+    if "total_drainage" in info:
+        meta_payload["totalDrainage"] = info["total_drainage"]
+
+    return {
+        "preview": {
+            "inputFiles": input_files,
+            "fileCount": len(input_files),
+            "totalSize": total_in_size,
+        },
+        "meta": meta_payload,
+        "results": results_payload,
+        "outputFiles": output_files_meta,
+        "zipBase64": base64.b64encode(result_zip).decode("ascii"),
+    }
 
 
 @app.post("/api/compute")
 async def compute(
     file: UploadFile = File(..., description="输入 ZIP — 含 in_*.txt/static_*.txt"),
     calc_mode: str = Form("both", description="crop / irrigation / both"),
+    format: str = Form("zip", description="zip (binary) | json (preview+results+base64)"),
 ) -> Response:
     content = await file.read()
     if not content:
         raise HTTPException(400, "上传文件为空")
 
     try:
+        if format == "json":
+            payload = _run_irrigation_full(content, calc_mode)
+            return JSONResponse(content=payload)
         zip_bytes, info = _run_irrigation(content, calc_mode)
     except HTTPException:
         raise
