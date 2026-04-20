@@ -9,9 +9,7 @@ Output: ZIP containing OUT_GGXS_*.txt + OUT_PYCS_*.txt (+ water_balance_*.txt,
 """
 from __future__ import annotations
 
-import base64
 import io
-import json
 import os
 import sys
 import tempfile
@@ -21,10 +19,21 @@ import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
-import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+
+# --- shared helpers (see ~/Dev/devtools/lib/hydro_api_helpers.py) ---
+for _p in [Path.home() / "Dev/devtools/lib", Path("/var/www/devtools/lib")]:
+    if _p.exists():
+        sys.path.insert(0, str(_p))
+        break
+from hydro_api_helpers import (  # noqa: E402
+    build_json_response,
+    cors_origins,
+    preview_zip_files,
+    read_text_head,
+)
 
 # Project root on sys.path so `from src.irrigation...` resolves like Streamlit.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -38,11 +47,7 @@ app = FastAPI(title="hydro-irrigation-api", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3115",
-        "http://127.0.0.1:3115",
-        "https://hydro-irrigation.tianlizeng.cloud",
-    ],
+    allow_origins=cors_origins("hydro-irrigation", 3115),
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -74,24 +79,11 @@ _RESULT_GLOBS = (
 )
 
 
-def _collect_outputs(output_dir: Path, dest_zip: zipfile.ZipFile, seen: set[str]) -> int:
-    """Append matching files under `output_dir` (non-recursive) to dest_zip.
-    Returns number of files added. `seen` de-dupes across calls."""
-    added = 0
-    for pattern in _RESULT_GLOBS:
-        for f in sorted(output_dir.glob(pattern)):
-            if not f.is_file():
-                continue
-            if f.name in seen:
-                continue
-            seen.add(f.name)
-            dest_zip.writestr(f.name, f.read_bytes())
-            added += 1
-    return added
-
-
 def _run_irrigation(
-    zip_bytes: bytes, calc_mode: str, collect_full: bool = False
+    zip_bytes: bytes,
+    calc_mode: str,
+    *,
+    parse_outputs: bool = False,
 ) -> tuple[bytes, dict]:
     """Port of app.py's "开始计算" button handler, Streamlit stripped.
 
@@ -100,9 +92,9 @@ def _run_irrigation(
             data/            ← data_path; extracted input + generated OUT_*
     `Calculator` writes results to data_path and also to cwd/data/ (same dir).
 
-    When ``collect_full`` is True the returned ``info`` additionally contains:
-        input_files: [{name, size}]
-        output_files_raw: {name: bytes}
+    When ``parse_outputs`` is True the returned ``info`` additionally contains:
+        output_files: [{name, size, type}]
+        results:      {name: {kind, ...}}  (via read_text_head)
     """
     if calc_mode not in {"crop", "irrigation", "both"}:
         raise HTTPException(400, f"calc_mode 必须是 crop/irrigation/both，收到: {calc_mode!r}")
@@ -118,7 +110,6 @@ def _run_irrigation(
                 members = [m for m in zf.namelist() if not m.endswith("/")]
                 if not members:
                     raise HTTPException(400, "ZIP 为空，没有可用文件")
-                # Detect common prefix (single wrapping folder)
                 first_parts = {m.split("/", 1)[0] for m in members if "/" in m}
                 strip_prefix = None
                 if len(first_parts) == 1 and all(
@@ -126,7 +117,6 @@ def _run_irrigation(
                     for m in members
                 ):
                     strip_prefix = next(iter(first_parts))
-                input_files: list[dict] = []
                 for m in members:
                     name = m
                     if strip_prefix and m.startswith(f"{strip_prefix}/"):
@@ -134,10 +124,7 @@ def _run_irrigation(
                     if not name or name.startswith("__MACOSX"):
                         continue
                     flat_name = Path(name).name
-                    target = data_path / flat_name  # flat — no nested dirs
-                    data = zf.read(m)
-                    target.write_bytes(data)
-                    input_files.append({"name": flat_name, "size": len(data)})
+                    (data_path / flat_name).write_bytes(zf.read(m))
         except zipfile.BadZipFile as e:
             raise HTTPException(400, f"ZIP 解压失败: {e}") from e
 
@@ -153,7 +140,7 @@ def _run_irrigation(
             calc = Calculator(str(data_path), verbose=False)
             calc.load_data()
 
-            info = {
+            info: dict = {
                 "start_time": str(calc.current_time),
                 "forecast_days": int(calc.forecast_days),
                 "num_areas": len(calc.irrigation_manager.irrigation_areas),
@@ -193,7 +180,8 @@ def _run_irrigation(
         # Collect outputs from both data_path and tmpdir/data (same dir in our
         # layout, but be defensive — combine_results uses cwd/data explicitly).
         buf = io.BytesIO()
-        output_files_raw: dict[str, bytes] = {}
+        output_files_meta: list[dict] = []
+        parsed_results: dict[str, dict] = {}
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as out_zip:
             seen: set[str] = set()
 
@@ -206,8 +194,15 @@ def _run_irrigation(
                         seen.add(f.name)
                         data = f.read_bytes()
                         out_zip.writestr(f.name, data)
-                        if collect_full:
-                            output_files_raw[f.name] = data
+                        if parse_outputs:
+                            output_files_meta.append(
+                                {
+                                    "name": f.name,
+                                    "size": len(data),
+                                    "type": "txt" if f.suffix.lower() == ".txt" else "bin",
+                                }
+                            )
+                            parsed_results[f.name] = read_text_head(f)
                         added += 1
                 return added
 
@@ -218,118 +213,14 @@ def _run_irrigation(
             if added == 0:
                 raise HTTPException(500, "计算结束但没有生成任何 OUT_*.txt，可能输入格式有误")
 
-        if collect_full:
-            info["input_files"] = input_files
-            info["output_files_raw"] = output_files_raw
-        return buf.getvalue(), info
-
-
-_TABLE_ROW_LIMIT = 500
-_TEXT_PREVIEW_LINES = 50
-
-
-def _txt_to_payload(name: str, data: bytes) -> dict:
-    """Try to read a tab/whitespace-separated table; fall back to text preview.
-
-    Returns one of:
-        {"kind": "table", "columns": [...], "rows": [...], "totalRows": N}
-        {"kind": "text",  "text": "first N lines…", "totalLines": N}
-    """
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            text = data.decode("gbk")
-        except UnicodeDecodeError:
-            text = data.decode("utf-8", errors="replace")
-
-    # Try tab first (most output files), then whitespace.
-    for sep in ("\t", r"\s+"):
-        try:
-            df = pd.read_csv(
-                io.StringIO(text),
-                sep=sep,
-                engine="python",
-                dtype=str,
-                keep_default_na=False,
-            )
-            if df.shape[1] >= 2 and len(df) > 0:
-                total = len(df)
-                sliced = df.head(_TABLE_ROW_LIMIT) if total > _TABLE_ROW_LIMIT else df
-                # Attempt numeric coercion column-wise for nicer display.
-                for col in sliced.columns:
-                    try:
-                        coerced = pd.to_numeric(sliced[col])
-                        sliced[col] = coerced
-                    except (ValueError, TypeError):
-                        pass
-                parsed = json.loads(
-                    sliced.to_json(orient="split", force_ascii=False)
-                )
-                return {
-                    "kind": "table",
-                    "columns": [str(c) for c in parsed["columns"]],
-                    "rows": parsed["data"],
-                    "totalRows": int(total),
-                }
-        except Exception:
-            continue
-
-    # Fall back to plain text preview.
-    lines = text.splitlines()
-    preview = "\n".join(lines[:_TEXT_PREVIEW_LINES])
-    return {"kind": "text", "text": preview, "totalLines": len(lines)}
-
-
-def _run_irrigation_full(zip_bytes: bytes, calc_mode: str) -> dict:
-    """Run calc + build rich JSON payload (preview / meta / results / zipBase64)."""
-    started = time.perf_counter()
-    result_zip, info = _run_irrigation(zip_bytes, calc_mode, collect_full=True)
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-
-    input_files = info.get("input_files", [])
-    raw_outputs: dict[str, bytes] = info.get("output_files_raw", {})
-
-    output_files_meta: list[dict] = []
-    results_payload: dict[str, dict] = {}
-    for name in sorted(raw_outputs.keys()):
-        data = raw_outputs[name]
-        results_payload[name] = _txt_to_payload(name, data)
-        output_files_meta.append(
-            {
-                "name": name,
-                "size": len(data),
-                "type": "txt" if name.lower().endswith(".txt") else "bin",
+        if parse_outputs:
+            # Sort output files by name for stable ordering
+            output_files_meta.sort(key=lambda f: f["name"])
+            info["output_files"] = output_files_meta
+            info["results"] = {
+                name: parsed_results[name] for name in sorted(parsed_results.keys())
             }
-        )
-
-    total_in_size = sum(f["size"] for f in input_files)
-
-    meta_payload: dict = {
-        "calcMode": info.get("calc_mode", calc_mode),
-        "startTime": info.get("start_time"),
-        "forecastDays": info.get("forecast_days"),
-        "numAreas": info.get("num_areas"),
-        "systems": info.get("systems", []),
-        "elapsedMs": elapsed_ms,
-        "zipBytes": len(result_zip),
-    }
-    if "total_irrigation" in info:
-        meta_payload["totalIrrigation"] = info["total_irrigation"]
-    if "total_drainage" in info:
-        meta_payload["totalDrainage"] = info["total_drainage"]
-
-    return {
-        "preview": {
-            "inputFiles": input_files,
-            "fileCount": len(input_files),
-            "totalSize": total_in_size,
-        },
-        "meta": meta_payload,
-        "results": results_payload,
-        "outputFiles": output_files_meta,
-        "zipBase64": base64.b64encode(result_zip).decode("ascii"),
-    }
+        return buf.getvalue(), info
 
 
 @app.post("/api/compute")
@@ -342,11 +233,11 @@ async def compute(
     if not content:
         raise HTTPException(400, "上传文件为空")
 
+    started = time.perf_counter()
     try:
-        if format == "json":
-            payload = _run_irrigation_full(content, calc_mode)
-            return JSONResponse(content=payload)
-        zip_bytes, info = _run_irrigation(content, calc_mode)
+        zip_bytes, info = _run_irrigation(
+            content, calc_mode, parse_outputs=(format == "json")
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -354,6 +245,31 @@ async def compute(
             500,
             f"计算失败: {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}",
         )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    if format == "json":
+        preview = preview_zip_files(content, group_by_prefix=True)
+        meta_payload: dict = {
+            "calcMode": info.get("calc_mode", calc_mode),
+            "startTime": info.get("start_time"),
+            "forecastDays": info.get("forecast_days"),
+            "numAreas": info.get("num_areas"),
+            "systems": info.get("systems", []),
+            "elapsedMs": elapsed_ms,
+        }
+        if "total_irrigation" in info:
+            meta_payload["totalIrrigation"] = info["total_irrigation"]
+        if "total_drainage" in info:
+            meta_payload["totalDrainage"] = info["total_drainage"]
+
+        payload = build_json_response(
+            preview=preview,
+            meta=meta_payload,
+            results=info.get("results", {}),
+            zip_bytes=zip_bytes,
+            extras={"outputFiles": info.get("output_files", [])},
+        )
+        return JSONResponse(content=payload)
 
     # Headers are latin-1; URL-encode any CJK content.
     headers = {
